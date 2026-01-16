@@ -1,66 +1,106 @@
 #!/bin/bash
 
-# 1. System Dependencies & Environment
-apt-get update
-apt-get install -y git wget python3-venv libgl1 libglib2.0-0
+set -euo pipefail
 
-# Set up workspace
-cd /workspace
+. /venv/main/bin/activate
 
-# 2. Install Wan2GP (Supports Wan 2.1 & 2.2)
-if [ ! -d "Wan2GP" ]; then
-    git clone https://github.com/deepbeepmeep/Wan2GP.git
-fi
+apt-get install -y \
+    libasound2-dev \
+    pulseaudio-utils \
+    wget \
+    --no-install-recommends
+
+cd "$WORKSPACE"
+[[ -d "${WORKSPACE}/Wan2GP" ]] || git clone https://github.com/deepbeepmeep/Wan2GP
 cd Wan2GP
+[[ -n "{WAN2GP_VERSION:-}" ]] && git checkout "$WAN2GP_VERSION"
 
-# Create and activate virtual environment (Requires Python 3.10+)
-python3 -m venv venv
-source venv/bin/activate
+# Find the most appropriate backend given W2GP's torch version restrictions
+if [[ -z "${CUDA_VERSION:-}" ]]; then
+    echo "Error: CUDA_VERSION is not set or is empty." >&2
+    exit 1
+fi
+cuda_version=$(echo "$CUDA_VERSION" | cut -d. -f1,2)
+torch_backend=cu128
+# Convert versions like "12.7" and "12.8" to integers "127" and "128" for comparison
+cuda_version_int=$(echo "$cuda_version" | awk -F. '{printf "%d%d", $1, $2}')
+threshold_version_int=128
+if (( cuda_version_int < threshold_version_int )); then
+    torch_backend=cu126
+fi
 
-# Install Python requirements
-pip install --upgrade pip
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements.txt
-# Optional: Install SageAttention for speed (uncomment if needed)
-# pip install sageattention
+uv pip install torch==${TORCH_VERSION:-2.7.1} torchvision torchaudio --torch-backend="${TORCH_BACKEND:-$torch_backend}"
+uv pip install -r requirements.txt
 
-# 3. Download Your Custom Model (Wan2.1 I2V 14B 480P Q4KM)
-# Create checkpoints directory
+# --- CUSTOM MODEL INJECTION START ---
+echo "Downloading custom Civitai model..."
 mkdir -p ckpts
+# Download the Q4KM model
+wget -O ckpts/wan2.1_i2v_480p_q4km.gguf "https://civitai.com/api/download/models/2503787"
 
-# Download the model from Civitai (Model ID: 2503787)
-# Note: "Q4KM" suggests a GGUF/Quantized model. Wan2GP has experimental support for some quantized formats.
-echo "Downloading custom model from Civitai..."
-wget -O ckpts/Wan2.1_I2V_14B_480P_Q4KM.gguf "https://civitai.com/api/download/models/2503787"
-
-# 4. Register the Custom Model (Create a Profile)
-# This creates a JSON file in 'finetunes' so Wan2GP detects the custom model file.
+# Create a custom profile so Wan2GP UI shows your model
 mkdir -p finetunes
-cat <<EOF > finetunes/custom_wan_i2v.json
+cat > finetunes/my_custom_model.json << 'EOL'
 {
-    "name": "My Custom Wan2.1 I2V (480P)",
-    "description": "Custom Q4KM model from Civitai",
+    "name": "Custom Civitai Q4KM",
+    "description": "Wan 2.1 I2V 14B 480P Quantized",
     "architecture": "i2v_2_1",
     "model": {
-        "name": "Wan2.1 I2V 14B Q4KM",
+        "name": "wan2.1_i2v_480p_q4km",
         "architecture": "i2v_2_1",
-        "URLs": ["/workspace/Wan2GP/ckpts/Wan2.1_I2V_14B_480P_Q4KM.gguf"],
+        "URLs": ["ckpts/wan2.1_i2v_480p_q4km.gguf"],
         "auto_quantize": false
     }
 }
-EOF
+EOL
+# --- CUSTOM MODEL INJECTION END ---
 
-# 5. Create a Start Script for Easy Launch
-# This script sets the defaults: I2V mode, 14B model, 81 frames (approx 5s)
-cat <<EOF > /workspace/start_wan2gp.sh
+# Create Wan2GP startup scripts
+cat > /opt/supervisor-scripts/wan2gp.sh << 'EOL'
 #!/bin/bash
-cd /workspace/Wan2GP
-source venv/bin/activate
-# Launch with defaults: Image-to-Video, 14B, 81 frames (5 seconds)
-# Note: You can select your "My Custom Wan2.1" model from the dropdown in the UI.
-python wgp.py --i2v --frames 81 --listen --server-port 17860
-EOF
 
-chmod +x /workspace/start_wan2gp.sh
+utils=/opt/supervisor-scripts/utils
+. "${utils}/logging.sh"
+. "${utils}/cleanup_generic.sh"
+. "${utils}/environment.sh"
+. "${utils}/exit_serverless.sh"
+. "${utils}/exit_portal.sh" "Wan2GP"
 
-echo "Provisioning complete. Run '/workspace/start_wan2gp.sh' to start."
+echo "Starting Wan2GP"
+
+. /etc/environment
+. /venv/main/bin/activate
+
+cd "${WORKSPACE}/Wan2GP"
+export XDG_RUNTIME_DIR=/tmp
+export SDL_AUDIODRIVER=dummy
+python wgp.py 2>&1
+
+EOL
+
+chmod +x /opt/supervisor-scripts/wan2gp.sh
+
+# Generate the supervisor config files
+cat > /etc/supervisor/conf.d/wan2gp.conf << 'EOL'
+[program:wan2gp]
+environment=PROC_NAME="%(program_name)s"
+command=/opt/supervisor-scripts/wan2gp.sh
+autostart=true
+autorestart=true
+exitcodes=0
+startsecs=0
+stopasgroup=true
+killasgroup=true
+stopsignal=TERM
+stopwaitsecs=10
+# This is necessary for Vast logging to work alongside the Portal logs (Must output to /dev/stdout)
+stdout_logfile=/dev/stdout
+redirect_stderr=true
+stdout_events_enabled=true
+stdout_logfile_maxbytes=0
+stdout_logfile_backups=0
+EOL
+
+# Update supervisor to start the new service
+supervisorctl reread
+supervisorctl update
